@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+from html.parser import HTMLParser
+from pathlib import Path
+from time import sleep, time
+import logging
+import os
+import re
+
+import paho.mqtt.publish
+import requests
+
+
+CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '60'))
+MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
+MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
+
+uptime_re = re.compile(r'(\d*) days (\d*)h:(\d*)m:(\d*)s')
+
+group_names = {
+    'Task': 'task',
+    'Cable Modem Operation': 'operation',
+    'Downstream': 'downstream',
+    'Upstream': 'upstream',
+    'Signal Stats (Codewords)': 'stats',
+}
+
+key_names = {
+    'DOCSIS Downstream Channel Acquisition': 'downstream_acquisition',
+    'DOCSIS Ranging': 'docsis_ranging',
+    'Establish IP Connectivity using DHCP': 'establish_ip_using_dhcp',
+    'Establish Time Of Day': 'establish_time_of_day',
+    'Transfer Operational Parameters through TFTP': 'transfer_operational_params_tftp',
+    'Register Connection': 'register_connection',
+    'Cable Modem Status': 'cable_modem_status',
+    'System Up Time': 'uptime',
+    'Channel ID': 'channel_id',
+    'Frequency': 'frequency',
+    'Signal to Noise Ratio': 'snr',
+    'Power Level': 'power_level',
+    'Ranging Service ID': 'ranging_service_id',
+    'Symbol Rate': 'symbol_rate',
+    'Ranging Status': 'ranging_status',
+    'Total Unerrored Codewords': 'unerrored_codewords',
+    'Total Correctable Codewords': 'correctable_codewords',
+    'Total Uncorrectable Codewords': 'uncorrectable_codewords',
+}
+
+data_skel = {
+    'task': {
+        # 0- not started/offline
+        # 1- in progress
+        # 2- done/online
+        # 3- failed
+        'downstream_acquisition': 0,
+        'docsis_ranging': 0,
+        'establish_ip_using_dhcp': 0,
+        'establish_time_of_day': 0,
+        'transfer_operational_params_tftp': 0,
+        'register_connection': 0,
+        'cable_modem_status': 0,
+    },
+    'operation': {
+        'uptime': None,
+    },
+    'downstream': {
+        'channel_id': None,
+        'frequency': None,
+        'snr': None,
+        'power_level': None
+    },
+    'upstream': {
+        'channel_id': None,
+        'frequency': None,
+        'ranging_service_id': None,
+        'symbol_rate': None,
+        'power_level': None,
+        'ranging_status': 0  # 0 = failed, 1 = success
+    },
+    'stats': {
+        'channel_id': None,
+        'unerrored_codewords': None,
+        'correctable_codewords': None,
+        'uncorrectable_codewords': None
+    }
+}
+
+
+def fetch_data(uri):
+    """Fetch signal data from the cablemodem.
+    """
+    data = requests.get('http://192.168.100.1/' + uri, timeout=45)
+    if data.status_code != 200:
+        raise ValueError('Could not fetch cable modem stats: code %d' % data.status_code)
+
+    return data.text
+
+
+def send_mqtt(topic, payload):
+    try:
+        paho.mqtt.publish.single(topic, payload=payload, qos=1, hostname=MQTT_HOST, port=MQTT_PORT)
+    except Exception as ex:
+        print("MQTT Publish Failed: " + str(ex))
+
+
+class CableModemSignal(HTMLParser):
+    _data = {}
+
+    def __init__(self, *args, **kwargs):
+        super(CableModemSignal, self).__init__(*args, **kwargs)
+        self.table_level = 0
+        self.in_font = False
+        self.in_td = False
+        self.in_th = False
+        self.current_header = None
+        self.current_key = None
+        self.in_table_cell = False
+
+    def handle_data(self, data):
+        if self.table_level > 1:
+            return
+        data = data.strip()
+
+        if self.in_font and self.in_th:
+            if data not in ('Bonding Channel Value', 'Status', 'Value'):
+                self.current_header = data
+                self._data[data] = {}
+            #print('"%s", "%s", "%s"' % (self.current_header, self.current_key, data), end='')
+            
+        elif self.in_td:
+            if self.current_key:
+                self._data[self.current_header][self.current_key] = data
+                self.current_key = None
+            else:
+                self.current_key = data
+            #print('"%s", "%s", "%s"' % (self.current_header, self.current_key, data), end='')
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self.table_level += 1
+        elif self.table_level > 1:
+            return
+
+        if tag == 'font':
+            #print("<%s>" % tag, end='')
+            self.in_font = True
+        elif tag == 'th':
+            #print("<%s>" % tag, end='')
+            self.in_th = True
+        elif tag == 'td':
+            #print("<%s>" % tag, end='')
+            self.in_td = True
+
+    def handle_endtag(self, tag):
+        if tag == 'table':
+            self.table_level -= 1
+        elif self.table_level > 1:
+            return
+
+        if tag == 'font':
+            #print("</%s>" % tag)
+            self.in_font = False
+        elif tag == 'th':
+            #print("</%s>" % tag)
+            self.in_th = False
+        elif tag == 'td':
+            #print("</%s>" % tag)
+            self.in_td = False
+        elif tag == 'tr':
+            self.current_key = None
+
+
+def get_task_status(status):
+    if status.lower() in ('not started', 'offline'):
+        return 0
+    if status.lower() == 'in progress':
+        return 1
+    if status.lower() in ('done', 'online', 'success', 'operational'):
+        return 2
+    if status.lower() == 'failed':
+        return 3
+
+    logging.warn('get_task_status(): Unknown task status: %s', status)
+    return -1
+
+
+def get_uptime(uptime_string):
+    days, hours, minutes, seconds = uptime_re.match(uptime_string).groups()
+    seconds = int(seconds)
+    seconds += int(minutes) * 60
+    seconds += int(hours) * 60 * 60
+    seconds += int(days) * 24 * 60 * 60
+    return seconds
+
+
+def fetch_cable_stats():
+    """Get the stats page from the cablemodem.
+    """
+    try:
+        # Fetch the status and signal data
+        parser = CableModemSignal()
+        try:
+            for data_uri in ('indexData.htm', 'cmSignalData.htm'):
+                raw_html = fetch_data(data_uri)
+                parser.feed(raw_html)
+            return parser._data
+
+        except requests.exceptions.ConnectionError as e:
+            logging.error('Could not fetch cable modem stats: %s: %s', e.__class__.__name__, e) 
+
+        except requests.exceptions.Timeout as e:
+            logging.error('Could not fetch cable modem stats: %s: %s', e.__class__.__name__, e) 
+
+    except Exception as e:
+        logging.error('Uncaught exception: %s: %s', e.__class__.__name__, e)
+        logging.exception(e)
+
+
+def parse_cable_stats(raw_data):
+    """Parse the collected data
+    """
+    data = data_skel.copy()
+
+    for group in raw_data:
+        if group not in group_names:
+            continue
+
+        group_name = group_names[group]
+        for key in raw_data[group]:
+            if key not in key_names:
+                continue
+
+            key_name = key_names[key]
+
+            if group_name == 'task' or (group_name == 'upstream' and key_name == 'ranging_status'):
+                value = get_task_status(raw_data[group][key])
+            elif group_name == 'operation' and key_name == 'uptime':
+                value = get_uptime(raw_data[group][key])
+            elif raw_data[group][key] == 'n/a':
+                value = None
+            else:
+                value = raw_data[group][key].split()[0]
+                if value.isdigit():
+                    value = int(value)
+                else:
+                    value = float(value)
+
+            data[group_name][key_name] = value
+
+    return data
+
+
+if __name__ == '__main__':
+    while True:
+        start_time = time()
+        end_time = start_time + 60
+        raw_data = fetch_cable_stats()
+        data = parse_cable_stats(raw_data)
+
+        for group in data:
+            for key in data[group]:
+                print(f'cablemodem/{group}/{key} = {data[group][key]}')
+                send_mqtt(f'cablemodem/{group}/{key}', data[group][key])
+
+        if time() < end_time:
+            print(f'Sleeping until {end_time}...')
+            sleep(end_time - time())

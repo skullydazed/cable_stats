@@ -1,0 +1,2 @@
+# Settings used by ~/bin/docker_deploy
+DOCKER_RUN_ARGS='--network=mqtt -e MQTT_HOST=mosquitto'
