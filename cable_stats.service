@@ -1,0 +1,11 @@
+[Unit]
+Description=Pull stats from motorola cable modem and deliver to mqtt
+After=network.target
+
+[Service]
+User=pi
+Environment=MQTT_HOST=172.16.25.1
+ExecStart=/home/pi/cable_stats/cable_stats
+
+[Install]
+WantedBy=multi-user.target
