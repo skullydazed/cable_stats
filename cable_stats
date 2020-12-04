@@ -58,7 +58,7 @@ http.client.parse_headers = parse_headers
 import requests
 
 
-CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '60'))
+CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '300'))
 MQTT_HOST = os.environ.get('MQTT_HOST', 'localhost')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
 
@@ -302,7 +302,7 @@ def parse_cable_stats(raw_data):
 if __name__ == '__main__':
     while True:
         start_time = time()
-        end_time = start_time + 60
+        end_time = start_time + CHECK_INTERVAL
         raw_data = fetch_cable_stats()
         data = parse_cable_stats(raw_data)
 
